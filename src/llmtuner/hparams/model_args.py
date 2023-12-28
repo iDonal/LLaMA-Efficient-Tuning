@@ -1,6 +1,5 @@
-import torch
-from typing import Literal, Optional
-from dataclasses import dataclass, field
+from typing import Any, Dict, Literal, Optional
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass
@@ -9,19 +8,27 @@ class ModelArguments:
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune.
     """
     model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models."}
+        metadata={"help": "Path to the model weight or identifier from huggingface.co/models or modelscope.cn/models."}
+    )
+    adapter_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the adapter weight or identifier from huggingface.co/models."}
     )
     cache_dir: Optional[str] = field(
         default=None,
-        metadata={"help": "Where to store the pretrained models downloaded from huggingface.co."}
+        metadata={"help": "Where to store the pre-trained models downloaded from huggingface.co or modelscope.cn."}
     )
     use_fast_tokenizer: Optional[bool] = field(
-        default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."}
-    )
-    use_auth_token: Optional[bool] = field(
         default=False,
-        metadata={"help": "Will use the token generated when running `huggingface-cli login`."}
+        metadata={"help": "Whether or not to use one of the fast tokenizer (backed by the tokenizers library)."}
+    )
+    resize_vocab: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to resize the tokenizer vocab and the embedding layers."}
+    )
+    split_special_tokens: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not the special tokens should be split during the tokenization process."}
     )
     model_revision: Optional[str] = field(
         default="main",
@@ -37,11 +44,11 @@ class ModelArguments:
     )
     double_quantization: Optional[bool] = field(
         default=True,
-        metadata={"help": "Whether to use double quantization in int4 training or not."}
+        metadata={"help": "Whether or not to use double quantization in int4 training."}
     )
     rope_scaling: Optional[Literal["linear", "dynamic"]] = field(
         default=None,
-        metadata={"help": "Adopt scaled rotary positional embeddings."}
+        metadata={"help": "Which scaling strategy should be adopted for the RoPE embeddings."}
     )
     flash_attn: Optional[bool] = field(
         default=False,
@@ -51,37 +58,66 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enable shift short attention (S^2-Attn) proposed by LongLoRA."}
     )
-    checkpoint_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to the directory(s) containing the delta model checkpoints as well as the configurations."}
-    )
-    reward_model: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to the directory containing the checkpoints of the reward model."}
-    )
-    plot_loss: Optional[bool] = field(
+    use_unsloth: Optional[bool] = field(
         default=False,
-        metadata={"help": "Whether to plot the training loss after fine-tuning or not."}
+        metadata={"help": "Whether or not to use unsloth's optimization for the LoRA training."}
     )
-    hf_auth_token: Optional[str] = field(
+    disable_gradient_checkpointing: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to disable gradient checkpointing."}
+    )
+    upcast_layernorm: Optional[bool] = field(
+        default=False,
+        metadata={"help": "Whether or not to upcast the layernorm weights in fp32."}
+    )
+    hf_hub_token: Optional[str] = field(
         default=None,
         metadata={"help": "Auth token to log in with Hugging Face Hub."}
     )
-    layernorm_dtype: Optional[Literal["auto", "fp16", "bf16", "fp32"]] = field(
-        default="auto",
-        metadata={"help": "Data type of the layer norm weights."}
+    ms_hub_token: Optional[str] = field(
+        default=None,
+        metadata={"help": "Auth token to log in with ModelScope Hub."}
+    )
+    export_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the directory to save the exported model."}
+    )
+    export_size: Optional[int] = field(
+        default=1,
+        metadata={"help": "The file shard size (in GB) of the exported model."}
+    )
+    export_quantization_bit: Optional[int] = field(
+        default=None,
+        metadata={"help": "The number of bits to quantize the exported model."}
+    )
+    export_quantization_dataset: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to the dataset or dataset name to use in quantizing the exported model."}
+    )
+    export_quantization_nsamples: Optional[int] = field(
+        default=128,
+        metadata={"help": "The number of samples used for quantization."}
+    )
+    export_quantization_maxlen: Optional[int] = field(
+        default=1024,
+        metadata={"help": "The maximum length of the model inputs used for quantization."}
     )
 
     def __post_init__(self):
         self.compute_dtype = None
         self.model_max_length = None
 
-        if self.checkpoint_dir is not None: # support merging multiple lora weights
-            self.checkpoint_dir = [cd.strip() for cd in self.checkpoint_dir.split(",")]
+        if self.split_special_tokens and self.use_fast_tokenizer:
+            raise ValueError("`split_special_tokens` is only supported for slow tokenizers.")
 
-        if self.quantization_bit is not None:
-            assert self.quantization_bit in [4, 8], "We only accept 4-bit or 8-bit quantization."
+        if self.adapter_name_or_path is not None: # support merging multiple lora weights
+            self.adapter_name_or_path = [path.strip() for path in self.adapter_name_or_path.split(",")]
 
-        if self.use_auth_token == True and self.hf_auth_token is not None:
-            from huggingface_hub.hf_api import HfFolder # lazy load
-            HfFolder.save_token(self.hf_auth_token)
+        assert self.quantization_bit in [None, 8, 4], "We only accept 4-bit or 8-bit quantization."
+        assert self.export_quantization_bit in [None, 8, 4, 3, 2], "We only accept 2/3/4/8-bit quantization."
+
+        if self.export_quantization_bit is not None and self.export_quantization_dataset is None:
+            raise ValueError("Quantization dataset is necessary for exporting.")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)

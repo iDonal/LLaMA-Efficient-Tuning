@@ -3,13 +3,19 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple
 from transformers.utils import logging
-from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb, repeat_kv
+from transformers.models.llama.modeling_llama import LlamaAttention, apply_rotary_pos_emb
 
 try:
+    from transformers.models.llama.modeling_llama import repeat_kv
+except ImportError:
+    print("Please upgrade `transformers`.")
+
+from llmtuner.extras.packages import is_flash_attn2_available
+
+
+if is_flash_attn2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func # type: ignore
     from flash_attn.bert_padding import pad_input, unpad_input # type: ignore
-except ImportError:
-    print("FlashAttention-2 is not installed, ignore this if you are not using FlashAttention.")
 
 
 logger = logging.get_logger(__name__)
@@ -138,11 +144,11 @@ class LlamaFlashAttention2(LlamaAttention):
         input_dtype = query_states.dtype
         if input_dtype == torch.float32:
             logger.warning_once("The input hidden states seems to be silently casted in float32.")
-            query_states = query_states.to(torch.float16)
-            key_states = key_states.to(torch.float16)
-            value_states = value_states.to(torch.float16)
+            query_states = query_states.to(self.config.torch_dtype)
+            key_states = key_states.to(self.config.torch_dtype)
+            value_states = value_states.to(self.config.torch_dtype)
 
-        if getattr(self, "num_key_value_groups"):
+        if getattr(self, "num_key_value_groups", None):
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from datetime import timedelta
 
 from transformers import TrainerCallback
+from transformers.modeling_utils import custom_object_save, unwrap_model
 from transformers.trainer_utils import has_length, PREFIX_CHECKPOINT_DIR
 
 from llmtuner.extras.constants import LOG_FILE_NAME
@@ -12,9 +13,20 @@ from llmtuner.extras.logging import get_logger
 
 if TYPE_CHECKING:
     from transformers import TrainingArguments, TrainerState, TrainerControl
+    from trl import AutoModelForCausalLMWithValueHead
 
 
 logger = get_logger(__name__)
+
+
+def _save_model_with_valuehead(model: "AutoModelForCausalLMWithValueHead", output_dir: str) -> None:
+    model.pretrained_model.config.save_pretrained(output_dir)
+    if model.pretrained_model.can_generate():
+        model.pretrained_model.generation_config.save_pretrained(output_dir)
+    if getattr(model, "is_peft_model", False):
+        model.pretrained_model.save_pretrained(output_dir)
+    elif getattr(model.pretrained_model, "_auto_class", None): # must not a peft model
+        custom_object_save(model.pretrained_model, output_dir, config=model.pretrained_model.config)
 
 
 class SavePeftModelCallback(TrainerCallback):
@@ -24,19 +36,17 @@ class SavePeftModelCallback(TrainerCallback):
         Event called after a checkpoint save.
         """
         if args.should_save:
-            output_dir = os.path.join(args.output_dir, "{}-{}".format(PREFIX_CHECKPOINT_DIR, state.global_step))
-            model = kwargs.pop("model")
-            if getattr(model, "is_peft_model", False):
-                getattr(model, "pretrained_model").save_pretrained(output_dir)
+            _save_model_with_valuehead(
+                model=unwrap_model(kwargs.pop("model")),
+                output_dir=os.path.join(args.output_dir, "{}-{}".format(PREFIX_CHECKPOINT_DIR, state.global_step))
+            )
 
     def on_train_end(self, args: "TrainingArguments", state: "TrainerState", control: "TrainerControl", **kwargs):
         r"""
         Event called at the end of training.
         """
         if args.should_save:
-            model = kwargs.pop("model")
-            if getattr(model, "is_peft_model", False):
-                getattr(model, "pretrained_model").save_pretrained(args.output_dir)
+            _save_model_with_valuehead(model=unwrap_model(kwargs.pop("model")), output_dir=args.output_dir)
 
 
 class LogCallback(TrainerCallback):
@@ -66,7 +76,7 @@ class LogCallback(TrainerCallback):
             self.in_training = True
             self.start_time = time.time()
             self.max_steps = state.max_steps
-            if os.path.exists(os.path.join(args.output_dir, LOG_FILE_NAME)):
+            if os.path.exists(os.path.join(args.output_dir, LOG_FILE_NAME)) and args.overwrite_output_dir:
                 logger.warning("Previous log file in this folder will be deleted.")
                 os.remove(os.path.join(args.output_dir, LOG_FILE_NAME))
 
@@ -134,6 +144,11 @@ class LogCallback(TrainerCallback):
             elapsed_time=self.elapsed_time,
             remaining_time=self.remaining_time
         )
+        if self.runner is not None:
+            logger.info("{{'loss': {:.4f}, 'learning_rate': {:2.4e}, 'epoch': {:.2f}}}".format(
+                logs["loss"] or 0, logs["learning_rate"] or 0, logs["epoch"] or 0
+            ))
+
         os.makedirs(args.output_dir, exist_ok=True)
         with open(os.path.join(args.output_dir, "trainer_log.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(logs) + "\n")

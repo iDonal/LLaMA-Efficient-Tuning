@@ -1,10 +1,25 @@
 import gc
+import os
 import torch
 from typing import TYPE_CHECKING, Tuple
 from transformers import InfNanRemoveLogitsProcessor, LogitsProcessorList
+from transformers.utils import (
+    is_torch_bf16_cpu_available,
+    is_torch_bf16_gpu_available,
+    is_torch_cuda_available,
+    is_torch_npu_available,
+    is_torch_xpu_available
+)
+
+_is_fp16_available = is_torch_npu_available() or is_torch_cuda_available()
+try:
+    _is_bf16_available = is_torch_bf16_gpu_available() or is_torch_bf16_cpu_available()
+except:
+    _is_bf16_available = False
+
 
 if TYPE_CHECKING:
-    from transformers.modeling_utils import PreTrainedModel
+    from llmtuner.hparams import ModelArguments
 
 
 class AverageMeter:
@@ -49,10 +64,41 @@ def count_parameters(model: torch.nn.Module) -> Tuple[int, int]:
     return trainable_params, all_param
 
 
-def get_logits_processor() -> LogitsProcessorList:
+def get_current_device() -> torch.device:
+    r"""
+    Gets the current available device.
+    """
+    if is_torch_xpu_available():
+        device = "xpu:{}".format(os.environ.get("LOCAL_RANK", "0"))
+    elif is_torch_npu_available():
+        device = "npu:{}".format(os.environ.get("LOCAL_RANK", "0"))
+    elif is_torch_cuda_available():
+        device = "cuda:{}".format(os.environ.get("LOCAL_RANK", "0"))
+    else:
+        device = "cpu"
+
+    return torch.device(device)
+
+
+def get_logits_processor() -> "LogitsProcessorList":
+    r"""
+    Gets logits processor that removes NaN and Inf logits.
+    """
     logits_processor = LogitsProcessorList()
     logits_processor.append(InfNanRemoveLogitsProcessor())
     return logits_processor
+
+
+def infer_optim_dtype(model_dtype: torch.dtype) -> torch.dtype:
+    r"""
+    Infers the optimal dtype according to the model_dtype and device compatibility.
+    """
+    if _is_bf16_available and model_dtype == torch.bfloat16:
+        return torch.bfloat16
+    elif _is_fp16_available:
+        return torch.float16
+    else:
+        return torch.float32
 
 
 def torch_gc() -> None:
@@ -65,26 +111,21 @@ def torch_gc() -> None:
         torch.cuda.ipc_collect()
 
 
-def dispatch_model(model: "PreTrainedModel") -> "PreTrainedModel":
-    r"""
-    Dispatches a pre-trained model to GPUs with balanced memory.
-    Borrowed from: https://github.com/huggingface/transformers/blob/v4.31.0/src/transformers/modeling_utils.py#L2803
-    """
-    if getattr(model, "is_loaded_in_8bit", False) or getattr(model, "is_loaded_in_4bit", False): # do nothing
-        return model
+def try_download_model_from_ms(model_args: "ModelArguments") -> None:
+    if not use_modelscope() or os.path.exists(model_args.model_name_or_path):
+        return
 
-    if torch.cuda.device_count() > 1:
-        from accelerate import dispatch_model
-        from accelerate.utils import infer_auto_device_map, get_balanced_memory
+    try:
+        from modelscope import snapshot_download
+        revision = "master" if model_args.model_revision == "main" else model_args.model_revision
+        model_args.model_name_or_path = snapshot_download(
+            model_args.model_name_or_path,
+            revision=revision,
+            cache_dir=model_args.cache_dir
+        )
+    except ImportError:
+        raise ImportError("Please install modelscope via `pip install modelscope -U`")
 
-        if model._no_split_modules is None:
-            raise ValueError("The model class needs to implement the `_no_split_modules` attribute.")
 
-        kwargs = {"dtype": model.dtype, "no_split_module_classes": model._no_split_modules}
-        max_memory = get_balanced_memory(model, **kwargs)
-        # Make sure tied weights are tied before creating the device map.
-        model.tie_weights()
-        device_map = infer_auto_device_map(model, max_memory=max_memory, **kwargs)
-        return dispatch_model(model, device_map)
-    else:
-        return model.cuda()
+def use_modelscope() -> bool:
+    return bool(int(os.environ.get("USE_MODELSCOPE_HUB", "0")))
